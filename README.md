@@ -28,8 +28,8 @@ This tool supports:
 # 📥 Installation
 1. Clone the repository
 ```bash
-git clone https://github.com/yourusername/SecretScanner
-cd SecretScanner
+git clone https://github.com/sahandami/jscan.git
+cd jscan
 ```
 # ⚙️ Usage
 ```bash
