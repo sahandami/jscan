@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
+
 import re
 import argparse
 import requests
 import os
-from textwrap import shorten
+from urllib.parse import urlparse
 
-# --- SECRET PATTERNS FROM THE REPO ---
+# ----------------------------
+# Patterns
+# ----------------------------
+
 REGEX_PATTERNS = {
     "Google_API_Key": r"AIza[0-9A-Za-z\-_]{35}",
     "Google_Captcha": r"6L[0-9A-Za-z\-_]{38}|^6[0-9A-Za-z\-_]{39}$",
@@ -18,130 +22,223 @@ REGEX_PATTERNS = {
     "JWT_Token": r"ey[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+",
     "Bearer_JWT": r"Bearer [A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+",
     "Email_Address": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
-    "URL": r"https?://(?:www\.)?[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:/[\w\-._~:/?#\[\]@!$&'()*+,;=]*)?",
+    "URL": r"https?://(?:www\.)?[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:/[\w\-._~:/?#\[\]@!$&'()*+,;=]*)?",
 }
 
-def print_pattern_table():
-    """Print all regex patterns in a clean table."""
-    print("\nAvailable Regex Patterns:\n")
+RELATIVE_URL_REGEX = r"""(?:
+    (?:"|')
+    (?P<q>/[a-zA-Z0-9_\-/?.=&%#]+)
+    (?:"|')
+|
+    (?<!["'=])
+    (?P<n>/[a-zA-Z0-9_\-/?.=&%#]+)
+)"""
 
-    name_width = max(len(name) for name in REGEX_PATTERNS.keys())
-    regex_width = max(len(p) for p in REGEX_PATTERNS.values())
+# ----------------------------
+# Scope logic
+# ----------------------------
 
-    header = f"+{'-'*(name_width+2)}+{'-'*(regex_width+2)}+"
-    print(header)
-    print(f"| {'Pattern Name'.ljust(name_width)} | {'Regex Pattern'.ljust(regex_width)} |")
-    print(header)
+def parse_scopes(scope_string):
+    if not scope_string:
+        return []
 
-    for name, pattern in REGEX_PATTERNS.items():
-        print(f"| {name.ljust(name_width)} | {pattern.ljust(regex_width)} |")
-
-    print(header)
-    print()
-
-def filter_patterns(include, exclude):
-    """Return filtered regex dict based on include/exclude rules."""
-    filtered = {}
-
-    for name, pattern in REGEX_PATTERNS.items():
-        if include and name not in include:
-            continue
-        if exclude and name in exclude:
-            continue
-        filtered[name] = pattern
-
-    return filtered
+    return [s.strip().lower() for s in scope_string.split(",") if s.strip()]
 
 
-def scan_text_for_secrets(text, filename, patterns, debug=False):
-    """Scan text and print all matching regex patterns."""
+def derive_scope_from_url(url):
+    try:
+        host = urlparse(url).hostname
+        if not host:
+            return []
+
+        parts = host.split(".")
+        if len(parts) >= 2:
+            root = ".".join(parts[-2:])
+            return [f"*.{root}"]
+
+        return [host]
+    except:
+        return []
+
+
+def url_in_scope(url, scopes):
+    try:
+        host = urlparse(url).hostname
+        if not host:
+            return False
+
+        host = host.lower()
+
+        for scope in scopes:
+            scope = scope.lower()
+
+            if scope.startswith("*."):
+                base = scope[2:]
+                if host == base or host.endswith("." + base):
+                    return True
+            else:
+                if host == scope:
+                    return True
+
+        return False
+
+    except:
+        return False
+
+
+def resolve_url(base, path):
+    if not base:
+        return None
+    return base.rstrip("/") + "/" + path.lstrip("/")
+
+
+# ----------------------------
+# Scanner
+# ----------------------------
+
+def scan_text_for_secrets(text, filename, patterns, scopes=None, base_url=None, debug=False):
     findings = []
+    scopes = scopes or []
 
+    url_pattern = re.compile(patterns["URL"])
+    rel_pattern = re.compile(RELATIVE_URL_REGEX, re.VERBOSE)
+
+    seen = set()
+
+    # -------------------------
+    # 1. NORMAL SECRETS (NO FILTER)
+    # -------------------------
     for name, regex in patterns.items():
-        pattern = re.compile(regex)
-        for match in pattern.finditer(text):
-            findings.append((name, regex, match.group(0)))
+        if name in ["URL"]:
+            continue  # handled separately
 
+        pattern = re.compile(regex)
+
+        for match in pattern.finditer(text):
+            value = match.group(0)
+
+            if value not in seen:
+                seen.add(value)
+                findings.append((name, value))
+
+    # -------------------------
+    # 2. ABSOLUTE URLS (SCOPED)
+    # -------------------------
+    for m in url_pattern.finditer(text):
+        url = m.group(0)
+
+        if scopes and not url_in_scope(url, scopes):
+            continue
+
+        if url not in seen:
+            seen.add(url)
+            findings.append(("URL", url))
+
+    # -------------------------
+    # 3. RELATIVE URLS (SCOPED + RESOLVED)
+    # -------------------------
+    for m in rel_pattern.finditer(text):
+        path = m.group("q") or m.group("n")
+        if not path:
+            continue
+
+        full = resolve_url(base_url, path)
+        if not full:
+            continue
+
+        if scopes and not url_in_scope(full, scopes):
+            continue
+
+        if full not in seen:
+            seen.add(full)
+            findings.append(("RELATIVE_URL", full))
+
+    # -------------------------
+    # OUTPUT
+    # -------------------------
     if findings:
-        print(f"\n🔍 Secrets found in: {filename}")
-        for name, regex, secret in findings:
-            print(f"  - {name}: {secret}")
-            if debug:
-                print(f"      ↳ Regex matched: {regex}")
+        print(f"\n🔍 Findings in: {filename}")
+
+        for name, value in findings:
+            print(f"  - {name}: {value}")
 
     return findings
 
-
-def scan_local_file(path, patterns, debug=False):
+def scan_local_file(path, patterns, scopes=None, base_url=None, debug=False):
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             text = f.read()
-        scan_text_for_secrets(text, path, patterns, debug)
+
+        scan_text_for_secrets(text, path, patterns, scopes, base_url, debug)
     except Exception as e:
         print(f"⚠️ Could not open {path}: {e}")
 
 
-def scan_remote_file(url, patterns, debug=False):
+def scan_remote_file(url, patterns, scopes=None, base_url=None, debug=False):
     try:
         r = requests.get(url, timeout=10)
         if r.status_code == 200:
-            scan_text_for_secrets(r.text, url, patterns, debug)
+            scan_text_for_secrets(r.text, url, patterns, scopes, base_url, debug)
         else:
             print(f"⚠️ HTTP {r.status_code} for {url}")
     except Exception as e:
-        print(f"⚠️ Failed to fetch {url}: {e}")
+        print(f"⚠️ Failed: {url} -> {e}")
 
+
+# ----------------------------
+# Main
+# ----------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Scan JS for leaked secrets/api keys")
+    parser = argparse.ArgumentParser(description="JS secret & endpoint scanner")
 
-    parser.add_argument("-i", "--input", help="Single file path or URL", type=str)
-    parser.add_argument("-l", "--list", help="List of file paths or URLs", type=str)
+    parser.add_argument("-i", "--input", type=str)
+    parser.add_argument("-l", "--list", type=str)
 
-    parser.add_argument("--debug", action="store_true", help="Show matched regex patterns")
+    parser.add_argument("-s", "--scope", help="*.company.com,*.test.com")
+    parser.add_argument("--base", help="Base URL for resolving relative paths")
+    parser.add_argument("--debug", action="store_true")
 
-    parser.add_argument("--include", help="Only run specific regex names (comma separated)")
-    parser.add_argument("--exclude", help="Exclude specific regex names (comma separated)")
-
-    parser.add_argument("--list-patterns", action="store_true", help="Show all regex patterns in a table")
+    parser.add_argument("--include")
+    parser.add_argument("--exclude")
+    parser.add_argument("--list-patterns", action="store_true")
 
     args = parser.parse_args()
 
-    # If user wants to display all patterns
     if args.list_patterns:
-        print_pattern_table()
+        for k, v in REGEX_PATTERNS.items():
+            print(f"{k}: {v}")
         return
 
-    # No scanning input provided
     if not args.input and not args.list:
-        parser.error("Please provide -i, -l OR --list-patterns")
+        parser.error("Provide -i or -l")
 
-    include = args.include.split(",") if args.include else []
-    exclude = args.exclude.split(",") if args.exclude else []
+    scopes = parse_scopes(args.scope)
 
-    filtered_patterns = filter_patterns(include, exclude)
+    if args.input and args.input.startswith("http") and not scopes:
+        scopes = derive_scope_from_url(args.input)
+        if scopes:
+            print(f"[*] Auto scope: {scopes}")
+
+    if not args.base and args.input and args.input.startswith("http"):
+        args.base = "{uri.scheme}://{uri.netloc}".format(uri=urlparse(args.input))
+
+    patterns = REGEX_PATTERNS
 
     if args.input:
-        target = args.input.strip()
-        if target.startswith("http"):
-            scan_remote_file(target, filtered_patterns, args.debug)
-        elif os.path.isfile(target):
-            scan_local_file(target, filtered_patterns, args.debug)
-        else:
-            print(f"⚠️ Invalid file/URL: {target}")
+        if args.input.startswith("http"):
+            scan_remote_file(args.input, patterns, scopes, args.base, args.debug)
+        elif os.path.isfile(args.input):
+            scan_local_file(args.input, patterns, scopes, args.base, args.debug)
 
     if args.list:
         with open(args.list, "r") as f:
             for line in f:
-                target = line.strip()
-                if not target:
-                    continue
-                if target.startswith("http"):
-                    scan_remote_file(target, filtered_patterns, args.debug)
-                elif os.path.isfile(target):
-                    scan_local_file(target, filtered_patterns, args.debug)
-                else:
-                    print(f"⚠️ Skipping invalid: {target}")
+                t = line.strip()
+                if t.startswith("http"):
+                    scan_remote_file(t, patterns, scopes, args.base, args.debug)
+                elif os.path.isfile(t):
+                    scan_local_file(t, patterns, scopes, args.base, args.debug)
 
 
 if __name__ == "__main__":
