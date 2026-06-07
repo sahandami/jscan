@@ -34,23 +34,30 @@ cd jscan
 # ⚙️ Usage
 ```bash
 > jscan -h
-usage: jscan [-h] [-i INPUT] [-l LIST] [--debug] [--include INCLUDE] [--exclude EXCLUDE] [--list-patterns]
+usage: jscan [-h] [-i INPUT] [-l LIST] [-s SCOPE] [--base BASE]
+             [--debug] [--include INCLUDE] [--exclude EXCLUDE]
+             [--list-patterns]
 
-Scan JS for leaked secrets/api keys
+Scan JS files for leaked secrets and endpoints
 
 options:
   -h, --help            show this help message and exit
   -i INPUT, --input INPUT
                         Single file path or URL
   -l LIST, --list LIST  List of file paths or URLs
+  -s SCOPE, --scope SCOPE
+                        Comma separated scope list (*.company.com,*.test.com)
+  --base BASE           Base URL for resolving relative endpoints
   --debug               Show matched regex patterns
   --include INCLUDE     Only run specific regex names (comma separated)
   --exclude EXCLUDE     Exclude specific regex names (comma separated)
-  --list-patterns       Show all regex patterns in a table
+  --list-patterns      Show all regex patterns in a table
 ```
 # 🔗 Chaining With Other Recon Tools
 
 ```bash
 > echo "https://hackerone.com" | subjs | tee -a js.txt
 > jscan -l js.txt
+
+> jscan -i app.js --base https://company.com -s "*.company.com"
 ```
